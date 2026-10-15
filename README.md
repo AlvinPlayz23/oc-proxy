@@ -45,11 +45,21 @@ characters; any real conversation blows past that instantly. (`--file` alone
 does not work — the CLI rejects it.)
 
 **The CLI's own tools are suppressed.** `opencode run` injects its own
-bash/read/write tools, which cannot be disabled in this build, and `--auto`
+bash/read/write tools, which cannot be *removed* in this build, and `--auto`
 approves their permission prompts. Those `tool_use` events are swallowed and
 never forwarded. To keep them from touching your files, the shim runs the CLI
 with its working directory set to a throwaway scratch dir
 (`%LOCALAPPDATA%\Temp\oc_shim_cwd`). Real tool calls use absolute paths anyway.
+
+**The agent harness is replaced.** Each turn runs as `--agent oc-shim`, a
+passthrough agent the shim auto-provisions at
+`~/.config/opencode/agent/oc-shim.md`. Its body *replaces* OpenCode's agent
+system prompt, so the model stops being told to go inspect the filesystem.
+`/health` reports `agent_active` and `agent_file`.
+
+This does **not** remove the built-in tools — see the measurements below. It
+stops the model being *instructed* to reach for them, which is a real but
+partial win.
 
 **Tools work by prompt injection.** The shim serializes your OpenAI `tools`
 array into the prompt; the model replies with a fenced block:
@@ -201,6 +211,34 @@ opencode models | Select-String '^opencode/'
 
 Auto-discovery from `opencode models` is a planned improvement, not something
 this version does.
+
+---
+
+## Cutting OpenCode's harness: what works and what doesn't
+
+Measured on opencode-cli **2.0.26** — identical prompt, 4 runs each:
+
+| Approach | Result |
+|---|---|
+| `--agent <custom>` + `agent/*.md` | **Works.** The body replaces the agent system prompt. Verified with a marker instruction the model reproduced verbatim. ~2-3% fewer input tokens. |
+| `tools: {}` in agent frontmatter | **Silently ignored.** The key is dropped from the loaded definition — `opencode debug agents` shows no `tools` field on any agent, including ours. Phantom `tool_use` continued unchanged (4 vs 3 on the control). It reads like a successful disable; it is not one. |
+| `permission: {"*": "deny"}` | **Loads, drops `tool_use` to 0, and breaks auth.** Every run then fails `provider.auth` 403 "free tier can only be used from within OpenCode". Unusable. |
+
+The tool catalogue is therefore not removable — only *steerable*. The agent's
+system prompt is the lever: it tells the model it has no tools and that the
+fenced catalogue in the user message is authoritative. That cut phantom tool
+calls from **~3.0 to ~1.5 per turn**, measured. It does not reach zero, which
+is why the runtime `tool_use` suppression and the corrective-nudge retry in
+`collect()` stay in place — they are load-bearing, not belt-and-braces.
+
+Two things survive regardless of agent: a small base environment block (cwd,
+platform, date — the model will name the working directory unprompted) and the
+tool definitions themselves. A few hundred tokens; not worth fighting.
+
+This matters beyond tidiness. On a trivial "what is the marker?" prompt the
+default `build` agent fired `glob` plus two `shell` commands, one of them
+`Get-ChildItem Env:`. Any tool the harness never registered is still a tool the
+model can reach and the shim has no way to represent.
 
 ---
 

@@ -3,3 +3,14 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+
+# Throwaway probe scripts from debugging sessions (_t_*.ps1, _patch*.py, ...).
+# Left on disk, never committed.
+_t_*.ps1
+_t_*.py
+_patch*.py
+
+# Saved agent-session transcripts. Working notes, not project files.
+*discusiion*.md
+*discussion*.md
+*.transcript.md

@@ -20,16 +20,130 @@ Two hard problems this solves, both verified empirically (2026-09-28):
    tool-call block, and the shim parses it back into real OpenAI `tool_calls`
    frames. The client executes the tools; the shim never does.
 
-   The CLI injects its OWN tools (bash/read/write) that the client never
-   registered and cannot be disabled in this build (custom agent definitions in
-   opencode.json / agent/*.md are not loaded by opencode-cli 2.0.11). Those
-   `tool_use` events are therefore SUPPRESSED: never forwarded, and the model
-   is told up front it has no built-in tools. If it reaches for one anyway, the
-   shim injects a corrective nudge instead of leaking an alien tool call.
+   3. OpenCode's own agent harness.
+   Every `opencode run` starts by injecting OpenCode's agent system
+   prompt and its built-in tool catalogue (shell/glob/read/write/...),
+   none of which the client registered and none of which are reachable
+   over the OpenAI wire protocol. Measured on 2.0.26 (reproduce with
+   test_phantom_tools.py): asked three questions that need no tools at
+   all, the default agent fired 8 phantom tool calls - `glob`, `shell`,
+   `read`, `question`, and Code Mode's `execute` - because the wording
+   leaned toward files ("what is the marker?", "describe the project
+   structure"). It went looking for a *file* marker. The same three
+   prompts under `--agent oc-shim` fire 0. That delta is the point of
+   the custom agent.
+
+   Phantom calls are prompt-dependent, not constant: clean factual
+   prompts ("17 + 25", capital of Japan) fire 0 under both agents. The
+   confusion appears on exactly the wording a coding agent receives.
+
+   What was tried, and what the measurements actually showed:
+
+   * `--agent <custom>` + `agent/*.md` WORKS, and is the real fix.
+     The custom agent's body REPLACES the agent system prompt. Proof:
+     an agent whose body says "answer MARKER-4417-VERIFIED" makes the
+     model answer exactly that, while the default agent ignores the
+     question and goes exploring. Token cost drops ~2-3% versus build.
+
+   * `tools: {}` in the agent frontmatter is SILENTLY IGNORED. Measured
+     directly: an agent carrying the key and one without it were forced
+     to run the same `shell` command, and both executed it. `opencode
+     debug agents` reports no `tools` field on ANY agent, so that
+     command cannot settle the question either way - only a forced call
+     can. Do not rely on it.
+
+   * `permission: {...: "deny"}` loads and does drop tool_use, but it
+     reproducibly breaks auth: every run fails with `provider.auth` 403
+     "free tier can only be used from within OpenCode". It is `deny`
+     itself, not the wildcard - denying ten tools by name fails the
+     same way, while the identical key set set to `allow` authenticates
+     fine. The free tier appears to read lockdown as a signal. There is
+     no way to strip these tools without losing the free tier entirely.
+
+   * Code Mode is undocumented: `execute` is absent from the built-in
+     tool list in the official docs, so there is no documented
+     off-switch. It is suppressed along with everything else, not
+     removed.
+
+   So the tools cannot be removed in this build; they can only be
+   *steered*. SHIM_AGENT_MD therefore does not try to deny tools, it
+   writes a system prompt that tells the model it has none and that the
+   authoritative tool list is the fence in the user message. Combined
+   with the `tool_use` suppression and corrective-nudge retry in
+   `collect()`, and the throwaway scratch cwd as blast-radius control,
+   that keeps alien calls from ever reaching the client.
+
+   OpenCode also still injects a small base environment block (cwd,
+   platform, date) regardless of agent; the model will name the working
+   directory unprompted. A few hundred tokens, not worth fighting.
 """
 
-import asyncio, glob, json, os, shutil, uuid, argparse, re
+import asyncio, glob, json, os, shutil, subprocess, time, uuid, argparse, re
 from aiohttp import web
+
+
+# Custom agent whose body REPLACES OpenCode's agent system prompt on every shim
+# turn. That system-prompt swap is the one lever that verifiably works, so the
+# prompt below has to carry the whole instruction: the tool catalogue itself
+# cannot be emptied from this side (see the notes in the module docstring).
+SHIM_AGENT = "oc-shim"
+
+# NOTE: no `tools:` key on purpose. It is accepted by the frontmatter parser
+# and then silently dropped from the loaded definition, which reads like a
+# successful disable but changes nothing at runtime (measured: phantom
+# tool_use events continue unchanged). The system prompt below is the only
+# lever that actually works, so it has to carry the full instruction.
+SHIM_AGENT_MD = """---
+description: Passthrough agent for the OpenAI SSE shim. No tools, no harness.
+mode: primary
+temperature: 0
+---
+
+You are a text completion engine reached over an OpenAI-compatible HTTP API.
+
+You have no tools of your own. Anything you might expect to be available - a
+shell, a filesystem, a browser - does not exist here, and nothing you invent
+about your environment is trustworthy. Do not speculate about files, do not
+describe what you would run, and do not claim to have inspected anything.
+
+The ONLY tools that exist are the ones named in the user message, and they
+are reached exclusively through the fenced tool-call format described there.
+That list is authoritative; your own idea of what tools exist is not.
+
+Answer in plain prose unless a listed tool is genuinely required, in which
+case emit the fence and nothing else.
+"""
+
+
+def config_dir():
+    """OpenCode's global config dir, where agent/*.md definitions live."""
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    if xdg:
+        return os.path.join(xdg, "opencode")
+    return os.path.expandvars(r"%USERPROFILE%\.config\opencode")
+
+
+def agent_path():
+    return os.path.join(config_dir(), "agent", SHIM_AGENT + ".md")
+
+
+def ensure_agent():
+    """Provision the passthrough agent if absent. Never clobber a user edit.
+
+    If this fails the shim still works - it just runs with OpenCode's full
+    agent harness and the suppression layer in collect() carries the weight.
+    """
+    p = agent_path()
+    try:
+        if not os.path.exists(p):
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(SHIM_AGENT_MD)
+            print(f"[proxy] provisioned agent -> {p}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[proxy] WARN could not provision agent: {e}", flush=True)
+        return False
 
 
 def resolve_cli():
@@ -52,37 +166,131 @@ def resolve_cli():
 
 OPENCODE_CLI = resolve_cli()
 
-# The CLI's own built-in tools (bash/read/write) cannot be disabled in this
-# build and --auto approves their permission prompts. Keep its cwd in a throw-
-# away scratch dir so an alien tool can never touch real user files; client
-# tool calls all use absolute paths anyway.
+# Belt-and-braces with `--agent oc-shim`: keep the CLI's cwd in a throwaway
+# scratch dir so an alien tool can never touch real user files even if the
+# agent stops resolving. Client tool calls use absolute paths anyway.
 WORK_DIR = os.path.expandvars(r"%LOCALAPPDATA%\Temp\oc_shim_cwd")
 os.makedirs(WORK_DIR, exist_ok=True)
+HAVE_AGENT = ensure_agent()
 PER_READ_TIMEOUT = 300
 # Transient CLI failures worth a retry: the step watchdog aborts (often after a
 # permission prompt stalled), read timeouts, connection resets.
 TRANSIENT_RE = re.compile(r"interrupt|abort|timeout|econn|reset|timed out", re.I)
 DEFAULT_MODEL = "longcat-2.5-preview-free"
 
-FREE_MODELS = [
+# ── model catalogue ──────────────────────────────────────────────────────────
+#
+# The live list comes from `opencode models`, not from a literal here: OpenCode
+# retires and adds models without warning, and a hand-maintained list silently
+# rots (it already had one entry that no longer existed and six live models it
+# never mentioned). SEED_MODELS is only what we serve if the CLI cannot be
+# asked - never clobber the discovered list with it.
+SEED_MODELS = [
     "longcat-2.5-preview-free",
     "space-bunny-free",
     "mimo-v2.6-flash-free",
-    "ling-3.0-flash-fin-free",
     "nemotron-3-ultra-free",
     "nemotron-3.5-lightning-free",
+    "big-pickle",
 ]
+# Manual tombstones. These win over discovery so a model OpenCode still
+# advertises can be pinned off if it is unusable through the CLI.
 DEAD_MODELS = {
     "mimo-v2.5-free": "Model retired by OpenCode (provider.no-route).",
     "deepseek-v4-flash-free": "Model retired by OpenCode (provider.no-route).",
     "jev-1.13-free": "System One model - not a chat model, unreachable via CLI.",
+    # Advertised under opencode/ but never routable - requests failed before
+    # discovery existed and no -free entry in the provider list backs it.
+    "ling-3.0-flash-fin-free": "Not routable via the CLI (no such model under opencode/).",
 }
 ALIASES = {
     "longcat": "longcat-2.5-preview-free", "longcat-2.5": "longcat-2.5-preview-free",
     "bunny": "space-bunny-free", "space-bunny": "space-bunny-free",
-    "mimo": "mimo-v2.6-flash-free", "ling": "ling-3.0-flash-fin-free",
+    "mimo": "mimo-v2.6-flash-free",
     "nemotron": "nemotron-3-ultra-free", "nemotron-3-ultra": "nemotron-3-ultra-free",
+    "pickle": "big-pickle", "big-pickle": "big-pickle",
 }
+
+CATALOG_TTL = 1800          # re-poll `opencode models` at most this often
+DISCOVERY_TIMEOUT = 30      # seconds to wait on the CLI before giving up
+# Provider-level failure meaning "this model is gone", as opposed to a
+# transport blip. Anything matching is tombstoned for the process lifetime.
+NO_ROUTE_RE = re.compile(r"no-route|no_route|not\s*found|unknown\s*model|"
+                         r"model\s*not\s*(?:available|supported)", re.I)
+
+_CATALOG = {"models": list(SEED_MODELS), "source": "seed", "at": 0.0}
+# Models that died since the last poll. Cleared whenever discovery succeeds, so
+# a model that comes back is picked up again instead of staying dead.
+_RUNTIME_DEAD = set()
+
+
+def _models_sync():
+    """Shell out to `opencode models` and keep the opencode/ provider entries.
+
+    Runs in a worker thread so the event loop never blocks on the CLI.
+    """
+    out = subprocess.run([OPENCODE_CLI, "models"], capture_output=True,
+                         text=True, timeout=DISCOVERY_TIMEOUT,
+                         encoding="utf-8", errors="replace", env=cli_env())
+    if out.returncode != 0:
+        raise RuntimeError((out.stderr or out.stdout or "?").strip()[-200:])
+    models = set()
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("opencode/"):
+            models.add(line.split("/", 1)[1])
+    if not models:
+        raise RuntimeError("no opencode/ models in output")
+    return sorted(models)
+
+
+async def refresh_catalog():
+    """Re-poll the CLI. Returns (models, changed). Never raises."""
+    try:
+        found = await asyncio.get_running_loop().run_in_executor(None, _models_sync)
+    except Exception as e:
+        print(f"[proxy] WARN model discovery failed ({e}); keeping "
+              f"{len(_CATALOG['models'])} cached", flush=True)
+        return _CATALOG["models"], False
+    changed = found != _CATALOG["models"] or _CATALOG["source"] != "discovered"
+    _CATALOG.update(models=found, source="discovered", at=time.time())
+    _RUNTIME_DEAD.clear()
+    if changed:
+        added = sorted(set(found) - set(SEED_MODELS))
+        print(f"[proxy] models: discovered {len(found)} "
+              f"({', '.join(added) if added else 'no change'})", flush=True)
+    return found, changed
+
+
+def catalog():
+    """Live models: discovered (or seed), minus manual and runtime tombstones."""
+    dead = set(DEAD_MODELS) | _RUNTIME_DEAD
+    return [m for m in _CATALOG["models"] if m not in dead]
+
+
+def tombstone(model, reason):
+    """Mark a model dead for this process. A later successful poll revives it."""
+    if model not in _RUNTIME_DEAD:
+        _RUNTIME_DEAD.add(model)
+        print(f"[proxy] tombstoned {model}: {reason}", flush=True)
+
+
+def default_model():
+    """DEFAULT_MODEL if it survived, else the first live model, else the seed."""
+    live = catalog()
+    return DEFAULT_MODEL if DEFAULT_MODEL in live else (live[0] if live else DEFAULT_MODEL)
+
+
+async def catalog_watchdog(app):
+    """Keep the catalogue fresh for the process lifetime."""
+    while True:
+        await asyncio.sleep(CATALOG_TTL)
+        try:
+            await refresh_catalog()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
 OPEN_FENCE = "<oc_tool_call>"
 CLOSE_FENCE = "</oc_tool_call>"
@@ -338,6 +546,8 @@ async def run_opencode(model, prompt):
     """
     cmd = [OPENCODE_CLI, "run", "--format", "json", "--auto",
            "--model", "opencode/" + model]
+    if HAVE_AGENT:
+        cmd += ["--agent", SHIM_AGENT]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE, cwd=WORK_DIR, env=cli_env(),
@@ -421,7 +631,12 @@ async def collect(model, prompt, stream_cb=None):
                 elif ev == "alien_tool":
                     alien.append(payload)
         except ShimError as e:
-            if attempt < 2 and TRANSIENT_RE.search(str(e)):
+            if NO_ROUTE_RE.search(str(e)):
+                # The provider has retired this model out from under us. Drop it
+                # from the catalogue so the next /v1/models is honest, and don't
+                # burn retries on a call that cannot succeed.
+                tombstone(model, str(e))
+            elif attempt < 2 and TRANSIENT_RE.search(str(e)):
                 if stream_cb:
                     await stream_cb(f"\n[shim: CLI died ({e}); retrying turn]\n")
                 continue
@@ -554,29 +769,67 @@ async def handle_chat(request):
 
 
 async def handle_models(request):
+    live = catalog()
     return web.json_response({"object": "list", "data": [
         {"id": m, "object": "model", "created": 0, "owned_by": "opencode"}
-        for m in FREE_MODELS] + [
+        for m in live] + [
         {"id": a, "object": "model", "created": 0, "owned_by": "opencode-alias"}
-        for a in ALIASES]})
+        for a in ALIASES if ALIASES[a] in live]})
+
+
+async def handle_refresh(request):
+    """Force a re-poll. Useful right after OpenCode changes its model list."""
+    models, _ = await refresh_catalog()
+    return web.json_response({"ok": True, "source": _CATALOG["source"],
+                              "models": catalog(), "seen": len(models)})
 
 
 async def health(request):
     return web.json_response({
-        "status": "ok", "default_model": DEFAULT_MODEL, "free_models": FREE_MODELS,
-        "dead_models": sorted(DEAD_MODELS), "transport": "stdin",
+        "status": "ok", "default_model": default_model(),
+        "free_models": catalog(),
+        "catalog_source": _CATALOG["source"],
+        "catalog_age_s": round(time.time() - _CATALOG["at"], 1) if _CATALOG["at"] else None,
+        "dead_models": sorted(DEAD_MODELS),
+        "runtime_dead": sorted(_RUNTIME_DEAD),
+        "transport": "stdin",
         "tool_bridge": True, "cli": OPENCODE_CLI, "cli_exists": os.path.exists(OPENCODE_CLI),
+        "agent": SHIM_AGENT if HAVE_AGENT else None,
+        "agent_file": agent_path(), "agent_active": HAVE_AGENT,
     })
 
 
+async def on_startup(app):
+    """Seed the catalogue before serving, then keep it fresh in the background."""
+    await refresh_catalog()
+    app["watchdog"] = asyncio.create_task(catalog_watchdog(app))
+
+
+async def on_cleanup(app):
+    task = app.get("watchdog")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 def main():
+    global CATALOG_TTL
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=18788)
+    ap.add_argument("--catalog-ttl", type=int, default=CATALOG_TTL,
+                    help="seconds between `opencode models` re-polls")
     args = ap.parse_args()
+    CATALOG_TTL = max(60, args.catalog_ttl)
     app = web.Application(client_max_size=64 * 1024 * 1024)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
     app.router.add_get("/v1/models", handle_models)
+    app.router.add_get("/models/refresh", handle_refresh)
     app.router.add_post("/v1/chat/completions", handle_chat)
     app.router.add_post("/chat/completions", handle_chat)
     print(f"[proxy] streaming :{args.port} -> {WORK_DIR}", flush=True)
