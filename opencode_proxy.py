@@ -78,7 +78,7 @@ Two hard problems this solves, both verified empirically (2026-09-28):
    directory unprompted. A few hundred tokens, not worth fighting.
 """
 
-import asyncio, glob, json, os, shutil, subprocess, time, uuid, argparse, re
+import asyncio, contextlib, glob, json, os, shutil, subprocess, time, uuid, argparse, re
 from aiohttp import web
 
 
@@ -200,11 +200,90 @@ def resolve_cli():
 
 OPENCODE_CLI = resolve_cli()
 
+# Code Mode teaches the model to call tools as `tools.<name>(...)`. The shim
+# cannot act on that syntax: it is neither a `tool_use` event (suppressed in
+# pump()) nor an <oc_tool_call> fence (parsed in parse_tool_block()), so when
+# the model writes it as PROSE it reaches the client verbatim, mid-sentence.
+# SHIM_AGENT_MD forbids it; this detects the leak so the steering can be judged
+# from the log rather than by eye.
+#
+# Both call shapes are matched - `tools.shell(...)` and `tools["shell"](...)`.
+# Note this cannot tell a genuine leak from the model legitimately *discussing*
+# this syntax in code it was asked to write, so treat a hit as "look at this
+# turn", not as a guaranteed defect.
+PROSE_TOOLCALL_RE = re.compile(
+    r"""\btools\s*\.\s*([A-Za-z_$][\w$]*)\s*\(   # tools.shell(
+      | \btools\s*\[\s*["']([A-Za-z_$][\w$]*)["']\s*\]\s*\(  # tools["shell"](
+    """,
+    re.X)
+
+
+def scan_prose_toolcalls(text):
+    """Distinct tool names the model tried to call in prose."""
+    if not text:
+        return []
+    found = set()
+    for m in PROSE_TOOLCALL_RE.finditer(text):
+        found.add(m.group(1) or m.group(2))
+    return sorted(found)
+
+
+def log_leak(text):
+    """Leak report to append to a log line, or "" when the text is clean."""
+    leaked = scan_prose_toolcalls(text)
+    if not leaked:
+        return ""
+    return f" PROSE_TOOLCALL={leaked}"
+
 # Belt-and-braces with `--agent oc-shim`: keep the CLI's cwd in a throwaway
 # scratch dir so an alien tool can never touch real user files even if the
 # agent stops resolving. Client tool calls use absolute paths anyway.
 WORK_DIR = os.path.expandvars(r"%LOCALAPPDATA%\Temp\oc_shim_cwd")
-os.makedirs(WORK_DIR, exist_ok=True)
+
+
+def _cwd_usable(path):
+    """Can a Windows process actually be STARTED with this as its cwd?
+
+    Existing is not the same as usable. A directory left in a pending-delete
+    state still resolves its name and still satisfies os.path.isdir, but
+    CreateProcess refuses it with WinError 267 ("The directory name is
+    invalid"), and it cannot even be deleted until whatever handle is keeping
+    it alive goes away. Hit in the wild on this very path: every call failed
+    before the CLI was reached, and it surfaced only as a stream error, so the
+    proxy looked alive while being completely unable to serve anything. One
+    trivial process at startup is a cheap price for never losing a session to
+    it again.
+    """
+    comspec = os.environ.get("ComSpec") or "cmd.exe"
+    try:
+        subprocess.run([comspec, "/c", "exit", "0"], cwd=path,
+                       capture_output=True, timeout=15)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_work_dir():
+    """Pick a work dir that genuinely works, creating it if needed."""
+    global WORK_DIR
+    with contextlib.suppress(OSError):
+        os.makedirs(WORK_DIR, exist_ok=True)
+    if _cwd_usable(WORK_DIR):
+        return
+    for i in range(1, 5):
+        alt = f"{WORK_DIR}_{i}"
+        with contextlib.suppress(OSError):
+            os.makedirs(alt, exist_ok=True)
+        if _cwd_usable(alt):
+            print(f"[proxy] WARN {WORK_DIR} cannot be used as a cwd (stuck in a "
+                  f"pending-delete state, probably from an earlier run) - "
+                  f"falling back to {alt}", flush=True)
+            WORK_DIR = alt
+            return
+    print(f"[proxy] WARN no usable work dir under {WORK_DIR}*", flush=True)
+
+
+ensure_work_dir()
 HAVE_AGENT = ensure_agent()
 PER_READ_TIMEOUT = 300
 # Transient CLI failures worth a retry: the step watchdog aborts (often after a
@@ -362,14 +441,27 @@ def resolve_model(name):
 
 
 def cli_env():
-    """Subprocess env with a native PWD.
+    """Subprocess env with a native PWD, and a guaranteed SystemRoot.
 
     opencode-cli.exe chdir()s to $PWD. Under Git-Bash/MSYS that is a POSIX path
     ('/c/Users/...') the Windows binary cannot chdir into, and every call dies
     with 'Failed to change directory to /c/Users/...'.
+
+    SystemRoot is guaranteed for a less obvious reason: CreateProcess fails
+    outright with WinError 267 ('The directory name is invalid') when the
+    environment block it is handed has no SystemRoot - it cannot resolve the
+    system directory. This process inherits its own environment, so a launcher
+    with a curated or stripped environment produced a proxy where EVERY call
+    died before the CLI was even reached, reported only as a stream error.
     """
     env = dict(os.environ)
     env["PWD"] = WORK_DIR
+    if os.name == "nt":
+        root = env.get("SystemRoot") or env.get("windir")
+        if not root:
+            root = os.environ.get("SystemDrive", "C:") + "\\Windows"
+        env["SystemRoot"] = root
+        env.setdefault("windir", root)
     return env
 
 
@@ -573,6 +665,44 @@ class ShimError(Exception):
     pass
 
 
+# How long to wait for a killed CLI to actually go away, and how often to check
+# whether the client is still connected.
+REAP_TIMEOUT = 5.0
+DISCONNECT_POLL = 1.0
+
+
+async def reap(proc):
+    """Stop a CLI process that is still running. Never raises.
+
+    Kills the whole tree, not just the process we spawned. On this machine the
+    resolved CLI is a scoop shim that re-execs the real binary, so the model
+    work happens in a CHILD - killing only `proc` would leave that child
+    running, which is the exact thing we are trying to stop.
+
+    Called from a `finally`, including while a cancellation unwinds, hence the
+    broad swallows: failing to kill a process must not mask the original error.
+    """
+    if proc.returncode is not None:
+        return
+    killed = False
+    if os.name == "nt":
+        try:
+            done = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                  capture_output=True, timeout=10)
+            killed = done.returncode == 0
+        except Exception:
+            pass
+    if not killed:
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            return
+    try:
+        await asyncio.wait_for(proc.wait(), REAP_TIMEOUT)
+    except (asyncio.TimeoutError, ProcessLookupError, OSError):
+        pass
+
+
 async def run_opencode(model, prompt):
     """Yield events: ('text', delta) | ('tool', raw) | ('alien_tool', name).
 
@@ -626,16 +756,19 @@ async def run_opencode(model, prompt):
             err = (await proc.stderr.read()).decode("utf-8", "replace")[-500:]
             raise ShimError(f"opencode exit {rc}: {err}")
 
+    gen = pump()
     try:
-        async for ev in pump():
+        async for ev in gen:
             yield ev
-    except Exception:
-        if proc.returncode is None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-        raise
+    finally:
+        # A `finally`, NOT the `except Exception` that used to be here.
+        # GeneratorExit derives from BaseException, so when a client hung up and
+        # the consumer dropped this generator mid-turn, that handler never ran
+        # and the CLI was left running - still spending quota on a turn nobody
+        # would ever receive, its stdout pipe going nowhere. This runs on every
+        # exit path: normal end, ShimError, GeneratorExit, task cancellation.
+        await reap(proc)
+        await gen.aclose()
 
 
 async def collect(model, prompt, stream_cb=None):
@@ -652,8 +785,9 @@ async def collect(model, prompt, stream_cb=None):
         sp = Splitter()
         text_parts, tool_raw = [], []
         alien = []
+        agen = run_opencode(model, prompt)
         try:
-            async for ev, payload in run_opencode(model, prompt):
+            async for ev, payload in agen:
                 if ev == "text":
                     for kind, seg in sp.feed(payload):
                         if kind == "text":
@@ -675,6 +809,16 @@ async def collect(model, prompt, stream_cb=None):
                     await stream_cb(f"\n[shim: CLI died ({e}); retrying turn]\n")
                 continue
             raise
+        finally:
+            # Close it here rather than leaving it to the event loop's async
+            # generator finaliser. `async for` does not close its iterator when
+            # the body raises, and a raised stream_cb (client gone) is exactly
+            # how a cancel arrives - so without this the generator stayed
+            # suspended, and a suspended generator is not closed until it is
+            # collected, which is far too late to stop a model already running.
+            # aclose() throws GeneratorExit in immediately, which is what runs
+            # the kill in run_opencode().
+            await agen.aclose()
         for kind, seg in sp.flush():
             if kind == "text":
                 text_parts.append(seg)
@@ -759,6 +903,8 @@ async def handle_chat(request):
     if not stream:
         try:
             text, calls, alien = await collect(model, prompt)
+            print(f"[proxy] -> block done text={len(text)}ch tools={len(calls)}"
+                  f" alien={alien}{log_leak(text)}", flush=True)
             return web.json_response(final_body(cid, model, text, calls))
         except Exception as e:
             print(f"[proxy] ERROR: {e}", flush=True)
@@ -772,6 +918,28 @@ async def handle_chat(request):
     async def send(payload):
         await resp.write(f"data: {payload}\n\n".encode())
 
+    # Watch for the client going away. Relying on a failed write is not enough:
+    # while the model is quiet - thinking, or inside a long tool call - nothing
+    # gets written for minutes, and that quiet stretch is exactly when people
+    # hit cancel. aiohttp clears request.transport about a second after the
+    # peer drops the socket even when the handler writes nothing (measured), so
+    # a 1s poll catches a cancel while the turn is still running. Without this,
+    # a cancelled turn ran to completion and spent the quota anyway.
+    me = asyncio.current_task()
+    dropped = False
+
+    async def watch_client():
+        nonlocal dropped
+        while True:
+            await asyncio.sleep(DISCONNECT_POLL)
+            t = request.transport
+            if t is None or t.is_closing():
+                dropped = True
+                print("[proxy] client hung up - aborting the turn", flush=True)
+                me.cancel()
+                return
+
+    watcher = asyncio.create_task(watch_client())
     try:
         await send(chunk(cid, model, delta={"role": "assistant", "content": ""}))
 
@@ -784,7 +952,12 @@ async def handle_chat(request):
         await send(chunk(cid, model, finish="tool_calls" if calls else "stop"))
         await send("[DONE]")
         await resp.write_eof()
-        print(f"[proxy] -> done text={len(text)}ch tools={len(calls)} alien={alien}", flush=True)
+        print(f"[proxy] -> done text={len(text)}ch tools={len(calls)} alien={alien}"
+              f"{log_leak(text)}", flush=True)
+    except asyncio.CancelledError:
+        if not dropped:
+            raise       # not our watcher: loop shutdown, do not swallow it
+        print("[proxy] turn aborted, CLI killed", flush=True)
     except asyncio.TimeoutError:
         await send(chunk(cid, model, delta="[proxy] timeout waiting for opencode"))
         await send(chunk(cid, model, finish="stop"))
@@ -799,6 +972,10 @@ async def handle_chat(request):
             await resp.write_eof()
         except Exception:
             pass
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
     return resp
 
 

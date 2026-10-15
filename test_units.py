@@ -116,5 +116,23 @@ p = p4.build_prompt(huge)
 ok("200k-char prompt built", len(p) > 200000, f"len={len(p)}")
 ok("exceeds the Windows argv cap", len(p) > 32767)
 
+print("=== prose tool-call detector (Code Mode leak) ===")
+# The exact shape that leaked in the wild: tools.shell(...) mid-sentence.
+leak = "I'll start by exploring what we're working with.tools.shell({command:'ls'})."
+ok("catches tools.<name>( mid-sentence", p4.scan_prose_toolcalls(leak) == ["shell"],
+   f"got {p4.scan_prose_toolcalls(leak)!r}")
+ok("catches bracket form", p4.scan_prose_toolcalls('await tools["read"]({path:"a"})') == ["read"])
+ok("catches whitespace variant", p4.scan_prose_toolcalls("then tools . glob ( x )") == ["glob"])
+ok("dedupes repeats", p4.scan_prose_toolcalls("tools.a() and tools.a()") == ["a"])
+ok("multiple names sorted", p4.scan_prose_toolcalls("tools.z() tools.b()") == ["b", "z"])
+# Must NOT fire on things that merely look adjacent.
+ok("ignores plain prose", p4.scan_prose_toolcalls("I have no tools available.") == [])
+ok("ignores tools without a call", p4.scan_prose_toolcalls("the tools.shell name") == [])
+ok("ignores empty/None", p4.scan_prose_toolcalls("") == []
+   and p4.scan_prose_toolcalls(None) == [])
+ok("log_leak silent when clean", p4.log_leak("all good here") == "")
+ok("log_leak reports when dirty",
+   "PROSE_TOOLCALL=['shell']" in p4.log_leak("see tools.shell(1)"))
+
 print(f"\n================ {passed} passed, {failed} failed ================")
 sys.exit(1 if failed else 0)
