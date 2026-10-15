@@ -110,8 +110,17 @@ The ONLY tools that exist are the ones named in the user message, and they
 are reached exclusively through the fenced tool-call format described there.
 That list is authoritative; your own idea of what tools exist is not.
 
+NEVER write tool-call syntax in your prose. Do not write `tools.name(...)`,
+do not write JavaScript, do not write function-call notation of any kind, and
+do not narrate the mechanics of a call. A tool call that is not the fenced
+block is not a tool call - it is broken text that reaches the user verbatim
+and cannot be executed. If you are not using the fence, you are answering in
+plain prose.
+
 Answer in plain prose unless a listed tool is genuinely required, in which
 case emit the fence and nothing else.
+
+<!-- managed by opencode_proxy.py (rev 2) - do not edit; edits are replaced -->
 """
 
 
@@ -127,19 +136,44 @@ def agent_path():
     return os.path.join(config_dir(), "agent", SHIM_AGENT + ".md")
 
 
+AGENT_MARKER = "managed by opencode_proxy.py"
+
+
 def ensure_agent():
-    """Provision the passthrough agent if absent. Never clobber a user edit.
+    """Provision the passthrough agent, and refresh it when WE generated it.
+
+    Three cases:
+      * absent            -> write it
+      * ours but stale    -> rewrite (identity is the AGENT_MARKER comment, so
+                             a prompt fix like rev 2 actually reaches disk
+                             instead of sitting unused in this file forever)
+      * not ours          -> leave alone, the user replaced it deliberately
+
+    Leaving stale shim files in place was a real bug: SHIM_AGENT_MD was edited
+    to a stronger prompt, but the disk copy kept the weaker one because the
+    write was guarded by `if not exists`. test_agent_sync.py detects that
+    drift; this function is what prevents it.
 
     If this fails the shim still works - it just runs with OpenCode's full
     agent harness and the suppression layer in collect() carries the weight.
     """
     p = agent_path()
     try:
-        if not os.path.exists(p):
-            os.makedirs(os.path.dirname(p), exist_ok=True)
-            with open(p, "w", encoding="utf-8") as fh:
-                fh.write(SHIM_AGENT_MD)
-            print(f"[proxy] provisioned agent -> {p}", flush=True)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        existing = None
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as fh:
+                existing = fh.read()
+        if existing is not None and existing.strip() == SHIM_AGENT_MD.strip():
+            return True
+        if existing is not None and AGENT_MARKER not in existing:
+            print(f"[proxy] agent at {p} is user-managed - leaving it alone",
+                  flush=True)
+            return True
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(SHIM_AGENT_MD)
+        print(f"[proxy] {'refreshed' if existing else 'provisioned'} agent -> {p}",
+              flush=True)
         return True
     except Exception as e:
         print(f"[proxy] WARN could not provision agent: {e}", flush=True)
