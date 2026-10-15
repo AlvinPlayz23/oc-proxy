@@ -57,9 +57,21 @@ for payload in ["a < b", "x <oc_tool_c", "no fence </oc_tool_call> here",
     got = split_all(chunks)
     txt = "".join(s for k, s in got if k == "text")
     tool = "".join(s for k, s in got if k == "tool")
-    # Nothing should be lost; a stray close fence with no open stays prose.
-    ok(f"no data loss @ {payload[:24]!r}", (txt + tool) == payload or tool != "",
+    # Nothing is lost, with one deliberate exception: a closing fence with no
+    # opening one is OUR marker, so it is dropped rather than streamed to a
+    # client. Compare against the payload with those markers removed in place.
+    expect = payload.replace(p4.CLOSE_FENCE, "")
+    ok(f"no data loss @ {payload[:24]!r}", txt == expect or tool != "",
        f"txt={txt!r} tool={tool!r}")
+
+print("=== splitter: an unpaired close fence never reaches a client ===")
+sp = p4.Splitter()
+got = list(sp.feed('oops {"name": "read"} </oc_tool_call> and more'))
+got += list(sp.flush())
+txt = "".join(s for k, s in got if k == "text")
+ok("marker withheld", p4.CLOSE_FENCE not in txt, f"txt={txt!r}")
+ok("surrounding prose kept", txt == 'oops {"name": "read"}  and more', f"txt={txt!r}")
+ok("stray counted", sp.stray == 1, f"stray={sp.stray}")
 
 print("=== parser: single, multiple, array, string-args ===")
 c1 = p4.parse_tool_block('{"name":"terminal","arguments":{"command":"ls"}}')
@@ -79,6 +91,22 @@ ok("arguments as a JSON string", len(c4) == 1 and
 
 ok("garbage yields no calls", p4.parse_tool_block("not json at all") == [])
 ok("empty yields no calls", p4.parse_tool_block("   ") == [])
+
+# The regression that started this: several fences' worth of JSON, concatenated
+# with nothing between them - which is exactly what collect() used to hand the
+# parser. It returned ZERO calls and the turn silently lost every one of them.
+joined = "".join('{"name":"read","arguments":{"path":"%s"}}' % p
+                 for p in ("a", "b", "c", "d"))
+c5 = p4.parse_tool_block(joined)
+ok("four objects, nothing between them", len(c5) == 4, f"got {len(c5)}")
+ok("and in order",
+   [json.loads(c["function"]["arguments"])["path"] for c in c5] == ["a", "b", "c", "d"])
+ok("two objects on ONE line",
+   len(p4.parse_tool_block('{"name":"a","arguments":{}} {"name":"b","arguments":{}}')) == 2)
+ok("comma separated too",
+   len(p4.parse_tool_block('{"name":"a","arguments":{}},{"name":"b","arguments":{}}')) == 2)
+ok("keeps what parses before junk",
+   len(p4.parse_tool_block('{"name":"a","arguments":{}}\nnot json\n{"name":"b"}')) == 1)
 
 print("=== ids and shape ===")
 ok("unique call ids", len({c["id"] for c in c2}) == 2)

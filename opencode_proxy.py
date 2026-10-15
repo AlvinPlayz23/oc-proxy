@@ -571,6 +571,9 @@ class Splitter:
     def __init__(self):
         self.buf = ""
         self.in_tool = False
+        # Closing fences that arrived with no opening fence: tool calls the
+        # model malformed, and which are therefore lost. Silent otherwise.
+        self.stray = 0
 
     def feed(self, new):
         self.buf += new
@@ -590,13 +593,28 @@ class Splitter:
                     self.buf = self.buf[cut:]
                 return
             i = self.buf.find(OPEN_FENCE)
-            if i >= 0:
+            j = self.buf.find(CLOSE_FENCE)
+            if i >= 0 and (j < 0 or i < j):
                 if i:
                     yield ("text", self.buf[:i])
                 self.buf = self.buf[i + len(OPEN_FENCE):]
                 self.in_tool = True
                 continue
-            keep = _partial_suffix_len(self.buf, OPEN_FENCE)
+            if j >= 0:
+                # A closing fence with no opening fence. The model meant to call
+                # a tool and malformed the block, so this would otherwise be
+                # streamed to the user as prose - our marker, the JSON, all of
+                # it. The marker is an implementation detail that must never
+                # reach a client, so drop it and count it. A non-zero count
+                # means calls were lost this turn, which is otherwise entirely
+                # invisible: the client just never receives them.
+                if j:
+                    yield ("text", self.buf[:j])
+                self.buf = self.buf[j + len(CLOSE_FENCE):]
+                self.stray += 1
+                continue
+            keep = max(_partial_suffix_len(self.buf, OPEN_FENCE),
+                       _partial_suffix_len(self.buf, CLOSE_FENCE))
             if len(self.buf) > keep:
                 cut = len(self.buf) - keep
                 yield ("text", self.buf[:cut])
@@ -611,28 +629,41 @@ class Splitter:
         self.in_tool = False
 
 
+def _json_values(raw):
+    """Yield every JSON value in `raw`, whatever separates them.
+
+    The parser used to try json.loads(whole) and then fall back to splitting on
+    newlines, so it coped with exactly one object per line. That is not the
+    shape that arrives: the model puts one object per <oc_tool_call> fence and
+    collect() concatenates the fence contents, so several objects routinely
+    land back to back with nothing between them. Measured against four
+    well-formed fences - precisely what the prompt asks the model for - the old
+    parser returned ZERO calls and the turn silently lost every tool call in
+    it. raw_decode walks them out one at a time and does not care about
+    separators. On malformed input it stops, keeping what it already yielded.
+    """
+    dec = json.JSONDecoder()
+    i, n = 0, len(raw)
+    while i < n:
+        while i < n and (raw[i].isspace() or raw[i] == ","):
+            i += 1
+        if i >= n:
+            return
+        try:
+            obj, i = dec.raw_decode(raw, i)
+        except json.JSONDecodeError:
+            return
+        yield obj
+
+
 def parse_tool_block(raw):
     """Parse the inside of a tool fence into a list of OpenAI tool calls."""
-    raw = raw.strip()
+    raw = (raw or "").strip()
     if not raw:
         return []
-    obj = None
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
-        objs = []
-        for line in raw.splitlines():
-            line = line.strip().rstrip(",")
-            if not line:
-                continue
-            try:
-                objs.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        obj = objs or None
-    if obj is None:
-        return []
-    items = obj if isinstance(obj, list) else [obj]
+    items = []
+    for obj in _json_values(raw):
+        items.extend(obj if isinstance(obj, list) else [obj])
     calls = []
     for it in items:
         if not isinstance(it, dict):
@@ -723,7 +754,7 @@ async def run_opencode(model, prompt):
     except (BrokenPipeError, ConnectionResetError):
         pass
 
-    sent = ""
+    sent = {}
 
     async def pump():
         nonlocal sent
@@ -748,9 +779,25 @@ async def run_opencode(model, prompt):
             elif t == "text":
                 part = obj.get("part", {})
                 new = part.get("text", obj.get("text", ""))
-                if new and len(new) > len(sent):
-                    yield ("text", new[len(sent):])
-                    sent = new
+                if new:
+                    # Keyed by part id. A turn emits one text event PER PART,
+                    # it is not one ever-growing buffer, so the single shared
+                    # `sent` this replaced was comparing unrelated parts against
+                    # each other: a later part the same length or shorter was
+                    # dropped outright, and a longer one was sliced at an
+                    # offset belonging to a different part. Measured with four
+                    # equal-length parts, it emitted ONE of them. The ids are
+                    # what make the comparison mean anything.
+                    key = part.get("id") or ""
+                    prev = sent.get(key, "")
+                    if not new.startswith(prev):
+                        # Same id, but not a continuation - treat it as fresh
+                        # text rather than slicing it against a prefix it does
+                        # not actually share.
+                        prev = ""
+                    if len(new) > len(prev):
+                        yield ("text", new[len(prev):])
+                        sent[key] = new
         rc = await proc.wait()
         if rc != 0:
             err = (await proc.stderr.read()).decode("utf-8", "replace")[-500:]
@@ -827,7 +874,17 @@ async def collect(model, prompt, stream_cb=None):
             else:
                 tool_raw.append(seg)
 
-        calls = parse_tool_block("".join(tool_raw))
+        # "\n", not "": each fence holds an independent JSON value, and gluing
+        # them together with nothing between them produced a blob no parser can
+        # read - four well-formed fences became zero tool calls, in silence.
+        calls = parse_tool_block("\n".join(tool_raw))
+        if len(calls) < len(tool_raw) or sp.stray:
+            # Losing a tool call is otherwise completely invisible: the client
+            # simply never receives it and the turn looks merely unhelpful,
+            # which is the worst kind of bug to be handed.
+            print(f"[proxy] WARN tool blocks={len(tool_raw)} parsed={len(calls)} "
+                  f"stray_close_fences={sp.stray} - tool calls were lost",
+                  flush=True)
         if calls or not alien or attempt == 2:
             return "".join(text_parts), calls, alien
         # The model tried a tool the client never registered. Correct it.
